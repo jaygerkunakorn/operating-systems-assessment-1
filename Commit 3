@@ -1,0 +1,118 @@
+use std::env;
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::unix::io::AsRawFd;
+use nix::unistd::{fork, ForkResult, execvp, dup2, pipe, close};
+use nix::sys::wait::waitpid;
+use std::ffi::CString;
+
+fn main() {
+    loop {
+        // Show current directory
+        let cwd = env::current_dir().unwrap_or_else(|_| "/".into());
+        print!("vssh:{}$ ", cwd.display());
+        io::stdout().flush().unwrap();
+
+        // Read input
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            eprintln!("Failed to read input");
+            continue;
+        }
+
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+        if input == "exit" {
+            break;
+        }
+
+        // Handle cd
+        if input.starts_with("cd ") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() > 1 {
+                if let Err(e) = env::set_current_dir(parts[1]) {
+                    eprintln!("cd error: {}", e);
+                }
+            }
+            continue;
+        }
+
+        // Background execution?
+        let mut background = false;
+        let mut command = input.to_string();
+        if command.ends_with('&') {
+            background = true;
+            command.pop();
+            command = command.trim().to_string();
+        }
+
+        // Handle I/O redirection
+        let mut parts: Vec<&str> = command.split_whitespace().collect();
+        let mut infile = None;
+        let mut outfile = None;
+
+        let mut i = 0;
+        while i < parts.len() {
+            match parts[i] {
+                "<" if i + 1 < parts.len() => {
+                    infile = Some(parts.remove(i + 1));
+                    parts.remove(i);
+                }
+                ">" if i + 1 < parts.len() => {
+                    outfile = Some(parts.remove(i + 1));
+                    parts.remove(i);
+                }
+                _ => i += 1,
+            }
+        }
+
+        // Convert command into CString args
+        let argv: Vec<CString> = parts.iter().map(|&s| CString::new(s).unwrap()).collect();
+        if argv.is_empty() {
+            continue;
+        }
+
+        // Fork
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // Input redirection
+                if let Some(file) = infile {
+                    if let Ok(f) = File::open(file) {
+                        let fd = f.as_raw_fd();
+                        let _ = dup2(fd, 0);
+                    } else {
+                        eprintln!("Failed to open input file");
+                        std::process::exit(1);
+                    }
+                }
+                // Output redirection
+                if let Some(file) = outfile {
+                    if let Ok(f) = File::create(file) {
+                        let fd = f.as_raw_fd();
+                        let _ = dup2(fd, 1);
+                    } else {
+                        eprintln!("Failed to create output file");
+                        std::process::exit(1);
+                    }
+                }
+                // Exec
+                if let Err(e) = execvp(&argv[0], &argv) {
+                    eprintln!("execvp error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            Ok(ForkResult::Parent { child }) => {
+                if background {
+                    println!("Started background process with PID {}", child);
+                } else {
+                    let _ = waitpid(child, None);
+                }
+            }
+            Err(e) => {
+                eprintln!("Fork failed: {}", e);
+            }
+        }
+    }
+}
