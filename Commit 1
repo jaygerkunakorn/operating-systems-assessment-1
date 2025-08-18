@@ -1,0 +1,95 @@
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{chdir, execvp, fork, ForkResult};
+use std::env;
+use std::ffi::CString;
+use std::io::{self, Write};
+use std::path::Path;
+
+fn main() {
+    loop {
+        // Print current directory
+        match env::current_dir() {
+            Ok(path) => print!("vssh:{}$ ", path.display()),
+            Err(_) => {
+                eprintln!("[vssh] failed to get current directory");
+                print!("vssh$ ");
+            }
+        }
+        io::stdout().flush().unwrap();
+
+        // Read user input
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            eprintln!("[vssh] failed to read input");
+            continue;
+        }
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        // Handle exit
+        if input == "exit" {
+            println!("[vssh] exiting...");
+            break;
+        }
+
+        // Handle cd
+        if input.starts_with("cd ") {
+            let dir = input.strip_prefix("cd ").unwrap().trim();
+            if let Err(err) = chdir(Path::new(dir)) {
+                eprintln!("[vssh] cd failed: {}", err);
+            }
+            continue;
+        }
+
+        // Handle background process (& at the end)
+        let (command, run_in_background) = if input.ends_with('&') {
+            (input.trim_end_matches('&').trim(), true)
+        } else {
+            (input, false)
+        };
+
+        let mut parts = command.split_whitespace();
+        let cmd = match parts.next() {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let args: Vec<CString> = std::iter::once(cmd)
+            .chain(parts)
+            .map(|s| CString::new(s).unwrap())
+            .collect();
+
+        // Fork and execute
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                if let Err(err) = execvp(&args[0], &args) {
+                    eprintln!("[vssh] execvp failed: {}", err);
+                    std::process::exit(1);
+                }
+            }
+            Ok(ForkResult::Parent { child }) => {
+                if run_in_background {
+                    println!("[vssh] running in background with pid {}", child);
+                } else {
+                    match waitpid(child, None) {
+                        Ok(WaitStatus::Exited(pid, status)) => {
+                            println!("[vssh] process {} exited with status {}", pid, status);
+                        }
+                        Ok(WaitStatus::Signaled(pid, sig, _)) => {
+                            println!("[vssh] process {} killed by signal {:?}", pid, sig);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            eprintln!("[vssh] waitpid failed: {}", err);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("[vssh] fork failed: {}", err);
+            }
+        }
+    }
+}
